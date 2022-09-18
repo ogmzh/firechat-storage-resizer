@@ -5,13 +5,10 @@ const spawn = require("child-process-promise").spawn;
 const path = require("path");
 const os = require("os");
 const fs = require("fs");
+const sizeOf = require("image-size");
 
 admin.initializeApp();
 
-const MAX_WIDTH = 250;
-const THUMB_MAX_HEIGHT = 200;
-const THUMB_MAX_WIDTH = 200;
-const THUMB_PREFIX = "thumb_";
 const runtimeOpts = {
   timeoutSeconds: 60,
   memory: "256MB",
@@ -29,20 +26,21 @@ const runtimeOpts = {
     - This function picks up the file, scales it down to 1080p max
     - Uploads the scaled down version to /files/${user?.uid}/assets/images/${file.name}
     - Generates a publicly available signed URL
-    - Deletes the original file
+    - Deletes the originally uploaded file
 */
-exports.imageToJPG = functions
+exports.imgDownscale = functions
   .runWith(runtimeOpts)
   .storage.object()
   .onFinalize(async (object) => {
     const filePath = object.name || "";
+
     functions.logger.log("Loaded file:", filePath);
 
-    // functions.logger.log("OBJECT META:", object.metadata);
-    // functions.logger.log(
-    //   "Metadata messageOrigin:",
-    //   object.metadata.messageOrigin
-    // );
+    // Exit if this is triggered on a file that is not an image.
+    if (!object.contentType?.startsWith("image/")) {
+      functions.logger.warn("This is not an image.");
+      return null;
+    }
 
     const baseFileName = path.basename(filePath);
     const fileDir = path.dirname(`${filePath}`);
@@ -51,22 +49,14 @@ exports.imageToJPG = functions
       functions.logger.info("skip running for scaled images");
       return null;
     }
-    functions.logger.log("OBJECT never notice:", object);
-    functions.logger.log("OBJECT never notice:", object.metadata);
-
+    const date = new Date();
     const scaledFilePath = path.normalize(
-      path.join(fileDir, `scaled_${baseFileName}`)
+      path.join(fileDir, `${date.toISOString()}_${baseFileName}`)
     );
     const tempLocalFile = path.join(os.tmpdir(), filePath);
     const tempLocalDir = path.dirname(tempLocalFile);
     const tempLocalScaledFile = path.join(os.tmpdir(), scaledFilePath);
     functions.logger.log("Destination file path:", tempLocalScaledFile);
-
-    // Exit if this is triggered on a file that is not an image.
-    if (!object.contentType?.startsWith("image/")) {
-      functions.logger.warn("This is not an image.");
-      return null;
-    }
 
     const bucket = admin.storage().bucket(object.bucket);
     // Create the temp directory where the storage file will be downloaded.
@@ -74,13 +64,34 @@ exports.imageToJPG = functions
     // Download file from bucket.
     await bucket.file(filePath).download({ destination: tempLocalFile });
     functions.logger.info("The file has been downloaded to", tempLocalFile);
-    await spawn("convert", [tempLocalFile, tempLocalScaledFile]);
-    functions.logger.log("Scaled created at", tempLocalScaledFile);
+
+    const imgInfo = fs.statSync(tempLocalFile);
+    const imgDimensions = sizeOf(tempLocalFile);
+    functions.logger.log(
+      "File size MB:",
+      (imgInfo.size / (1024 * 1024)).toFixed(2)
+    );
+    functions.logger.log(
+      `Image dimensions: ${imgDimensions.width}x${imgDimensions.height}`
+    );
+    if (imgDimensions.width > 1080) {
+      functions.logger.log("Image too large, downscaling");
+      await spawn("convert", [
+        tempLocalFile,
+        "-resize",
+        "x1080",
+        tempLocalScaledFile,
+      ]);
+    } else {
+      functions.logger.log("No downscale needed");
+      fs.copyFileSync(tempLocalFile, tempLocalScaledFile);
+    }
+    functions.logger.log("New file created at", tempLocalScaledFile);
     const bucketFilePath = scaledFilePath.replace("upload/", "images/");
     const response = await bucket.upload(tempLocalScaledFile, {
       destination: bucketFilePath,
     });
-    functions.logger.info("Scaled upload to storage:", bucketFilePath);
+    functions.logger.info("New file uploaded to storage:", bucketFilePath);
 
     const signedImageUrlArr = await response[0].getSignedUrl({
       action: "read",
